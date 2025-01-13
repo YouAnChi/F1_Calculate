@@ -86,14 +86,14 @@ func (sd *SynonymDict) LoadCiLinDict(filePath string) error {
 func (sd *SynonymDict) GetSynonyms(word string) []string {
 	sd.mu.RLock()
 	defer sd.mu.RUnlock()
-	
+
 	// 通过词林获取同义词
 	if code, ok := sd.cilinMap[word]; ok {
-		codeStr := fmt.Sprintf("%s%s%s%s%s", 
-			code.FirstLevel, 
-			code.SecondLevel, 
-			code.ThirdLevel, 
-			code.FourthLevel, 
+		codeStr := fmt.Sprintf("%s%s%s%s%s",
+			code.FirstLevel,
+			code.SecondLevel,
+			code.ThirdLevel,
+			code.FourthLevel,
 			code.FifthLevel)
 		if words, exists := sd.codemap[codeStr]; exists {
 			synonyms := make([]string, 0)
@@ -127,11 +127,61 @@ type TextSimilarity struct {
 	PositionAwareF1 float64 // 考虑位置的F1值
 }
 
+// WordType 词语类型
+type WordType int
+
+const (
+	TypeOther WordType = iota // 其他词
+	TypeVerb                  // 动词
+	TypeNoun                  // 名词
+	TypeAdj                   // 形容词
+	TypeAdv                   // 副词
+)
+
 // WordMatch 存储词语匹配信息
 type WordMatch struct {
 	word     string
 	score    float64
 	position int
+	wordType WordType // 添加词语类型
+}
+
+// 获取词语类型
+func getWordType(word string) WordType {
+	code, ok := globalSynonymDict.cilinMap[word]
+	if !ok {
+		return TypeOther
+	}
+
+	// 根据词林编码判断词语类型
+	switch code.FirstLevel {
+	case "A", "B", "C": // 名词相关
+		return TypeNoun
+	case "D", "E", "F": // 动词相关
+		return TypeVerb
+	case "G", "H": // 形容词相关
+		return TypeAdj
+	case "K": // 副词
+		return TypeAdv
+	default:
+		return TypeOther
+	}
+}
+
+// 获取词语类型的位置容忍度
+func getPositionTolerance(wordType WordType) float64 {
+	switch wordType {
+	case TypeVerb:
+		return 0.3 // 动词位置相对固定
+	case TypeNoun:
+		return 0.4 // 名词位置较为灵活
+	case TypeAdj:
+		return 0.5 // 形容词位置更灵活
+	case TypeAdv:
+		return 0.6 // 副词位置最灵活
+	default:
+		return 0.4 // 默认容忍度
+	}
 }
 
 // calculateSemanticF1 计算考虑语义和位置信息的F1值
@@ -150,6 +200,7 @@ func calculateSemanticF1(actual, predicted string, seg gse.Segmenter) TextSimila
 			word:     word,
 			position: i,
 			score:    1.0,
+			wordType: getWordType(word),
 		})
 	}
 
@@ -158,6 +209,7 @@ func calculateSemanticF1(actual, predicted string, seg gse.Segmenter) TextSimila
 			word:     word,
 			position: i,
 			score:    1.0,
+			wordType: getWordType(word),
 		})
 	}
 
@@ -211,6 +263,14 @@ func calculateMatches(actual, predicted []WordMatch, actualLen, predictedLen int
 
 	// 首先处理完全匹配
 	for _, actualWord := range actual {
+		actualType := getWordType(actualWord.word)
+		tolerance := getPositionTolerance(actualType)
+
+		bestMatchScore := 0.0
+		bestPositionScore := 0.0
+		bestMatchIdx := -1
+
+		// 找到最佳匹配
 		for j, predictedWord := range predicted {
 			if usedPredicted[j] {
 				continue
@@ -218,19 +278,38 @@ func calculateMatches(actual, predicted []WordMatch, actualLen, predictedLen int
 
 			matchScore := getMatchScore(actualWord.word, predictedWord.word)
 			if matchScore > 0 {
+				predictedType := getWordType(predictedWord.word)
+
+				// 计算位置分数
 				positionScore := calculatePositionScore(
 					float64(actualWord.position)/float64(actualLen),
 					float64(predictedWord.position)/float64(predictedLen),
+					tolerance,
 				)
 
-				if matchScore == 1.0 {
-					exactMatches++
+				// 根据词语类型调整分数
+				if actualType == predictedType {
+					matchScore *= 1.1 // 增加同类型词的匹配分数
 				}
-				semanticMatches += matchScore
-				positionAwareScore += matchScore * positionScore
-				usedPredicted[j] = true
-				break
+
+				// 更新最佳匹配
+				totalScore := matchScore * positionScore
+				if totalScore > bestMatchScore {
+					bestMatchScore = matchScore
+					bestPositionScore = positionScore
+					bestMatchIdx = j
+				}
 			}
+		}
+
+		// 使用最佳匹配更新分数
+		if bestMatchIdx >= 0 {
+			if bestMatchScore == 1.0 {
+				exactMatches++
+			}
+			semanticMatches += bestMatchScore
+			positionAwareScore += bestMatchScore * bestPositionScore
+			usedPredicted[bestMatchIdx] = true
 		}
 	}
 
@@ -239,6 +318,19 @@ func calculateMatches(actual, predicted []WordMatch, actualLen, predictedLen int
 		semanticMatches:    semanticMatches,
 		positionAwareScore: positionAwareScore,
 	}
+}
+
+// calculatePositionScore 计算位置相似度分数
+func calculatePositionScore(pos1, pos2 float64, tolerance float64) float64 {
+	diff := math.Abs(pos1 - pos2)
+
+	// 如果在容忍范围内，给予较高分数
+	if diff <= tolerance {
+		return 1.0 - (diff/tolerance)*0.2 // 在容忍范围内最多扣除20%的分数
+	}
+
+	// 超出容忍范围，使用更温和的衰减率
+	return math.Exp(-1.5 * (diff - tolerance) * (diff - tolerance))
 }
 
 // getMatchScore 获取两个词的匹配分数
@@ -284,12 +376,6 @@ func calculateCharacterOverlap(word1, word2 string) float64 {
 	}
 
 	return float64(common) / math.Max(float64(len(chars1)), float64(len(chars2)))
-}
-
-// calculatePositionScore 计算位置相似度分数
-func calculatePositionScore(pos1, pos2 float64) float64 {
-	diff := math.Abs(pos1 - pos2)
-	return math.Exp(-3 * diff * diff) // 使用较温和的衰减率
 }
 
 func calculateF1Score(precision, recall float64) float64 {
@@ -340,12 +426,11 @@ func main() {
 
 	// 创建新的Excel文件
 	outFile := excelize.NewFile()
-	defer outFile.Close()
 
-	// 添加表头
-	headers := []string{"标准答案", "预测文本", "基础F1值", "语义F1值", "位置感知F1值", "精确率", "召回率"}
-	for colIdx, header := range headers {
-		cell, _ := excelize.CoordinatesToCellName(colIdx+1, 1)
+	// 设置表头
+	headers := []string{"标准答案", "预测文本", "语义F1值"}
+	for i, header := range headers {
+		cell := string(rune('A'+i)) + "1"
 		outFile.SetCellValue("Sheet1", cell, header)
 	}
 
@@ -366,21 +451,17 @@ func main() {
 		rowNum := rowIdx + 1
 		outFile.SetCellValue("Sheet1", fmt.Sprintf("A%d", rowNum), actual)
 		outFile.SetCellValue("Sheet1", fmt.Sprintf("B%d", rowNum), predicted)
-		outFile.SetCellValue("Sheet1", fmt.Sprintf("C%d", rowNum), similarity.F1)
-		outFile.SetCellValue("Sheet1", fmt.Sprintf("D%d", rowNum), similarity.SemanticF1)
-		outFile.SetCellValue("Sheet1", fmt.Sprintf("E%d", rowNum), similarity.PositionAwareF1)
-		outFile.SetCellValue("Sheet1", fmt.Sprintf("F%d", rowNum), similarity.Precision)
-		outFile.SetCellValue("Sheet1", fmt.Sprintf("G%d", rowNum), similarity.Recall)
+		outFile.SetCellValue("Sheet1", fmt.Sprintf("C%d", rowNum), similarity.SemanticF1)
 	}
 
 	// 调整列宽
-	outFile.SetColWidth("Sheet1", "A", "G", 20)
+	outFile.SetColWidth("Sheet1", "A", "C", 30)
 
 	// 生成带时间戳的文件名
 	timestamp := time.Now().Format("2006-01-02_15-04-05")
-	newFilePath := fmt.Sprintf("output_%s.xlsx", timestamp)
+	newFilePath := fmt.Sprintf("语义F1值_%s.xlsx", timestamp)
 	if err := outFile.SaveAs(newFilePath); err != nil {
-		log.Fatalf("保存结果文件失败：%v", err)
+		log.Fatalf("保存结果文件失败:%v", err)
 	}
 
 	fmt.Printf("计算完成，结果已保存到当前目录下的: %s\n", newFilePath)
