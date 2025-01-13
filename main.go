@@ -2,16 +2,13 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math"
-	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-ego/gse"
 	"github.com/xuri/excelize/v2"
@@ -28,7 +25,6 @@ type CiLinCode struct {
 
 // SynonymDict 同义词字典
 type SynonymDict struct {
-	dict     map[string][]string
 	cilinMap map[string]CiLinCode // 词语到编码的映射
 	codemap  map[string][]string  // 编码到词语的映射
 	mu       sync.RWMutex
@@ -36,7 +32,6 @@ type SynonymDict struct {
 
 // 全局同义词字典
 var globalSynonymDict = &SynonymDict{
-	dict:     make(map[string][]string),
 	cilinMap: make(map[string]CiLinCode),
 	codemap:  make(map[string][]string),
 }
@@ -81,284 +76,45 @@ func (sd *SynonymDict) LoadCiLinDict(filePath string) error {
 		for _, word := range words {
 			sd.cilinMap[word] = cilinCode
 		}
-
-		// 将同一编码下的词语互相设为同义词
-		for i, word := range words {
-			if sd.dict[word] == nil {
-				sd.dict[word] = make([]string, 0)
-			}
-			for j, synonym := range words {
-				if i != j && !contains(sd.dict[word], synonym) {
-					sd.dict[word] = append(sd.dict[word], synonym)
-				}
-			}
-		}
 		sd.mu.Unlock()
 	}
 
 	return scanner.Err()
 }
 
-// DownloadCiLinDict 下载哈工大同义词词林
-func (sd *SynonymDict) DownloadCiLinDict() error {
-	// 使用本地默认同义词表
-	defaultSynonyms := map[string][]string{
-		"非常": {"很", "特别", "极其", "十分", "格外"},
-		"好吃": {"美味", "可口", "美味可口", "美味佳肴", "佳肴", "美食"},
-		"喜欢": {"爱", "热爱", "钟爱", "喜爱", "爱好"},
-		"漂亮": {"美丽", "好看", "美观", "动人", "标致"},
-		"快乐": {"开心", "高兴", "愉快", "欢乐", "欣喜"},
-		"生气": {"愤怒", "恼怒", "发火", "动怒", "光火"},
-		"聪明": {"智慧", "伶俐", "智慧", "明智", "睿智"},
-		"努力": {"奋斗", "拼搏", "用功", "勤奋", "奋进"},
-		"成功": {"胜利", "成就", "达成", "实现", "完成"},
-		"重要": {"关键", "主要", "核心", "关键", "要害"},
-		"应该": {"必须", "需要", "理应", "应当", "须要"},
-		"保护": {"爱护", "维护", "呵护", "保卫", "守护"},
-		"独特": {"特别", "特殊", "与众不同", "别致", "新颖"},
-		"动听": {"悦耳", "好听", "优美", "美妙", "动人"},
-		"复杂": {"繁杂", "繁复", "纷繁", "错综", "难解"},
-		"今天": {"今日", "这天", "当天", "这一天"},
-		"工作": {"劳动", "事业", "职业", "事务", "任务"},
-		"认真": {"严谨", "专注", "细致", "用心", "专心"},
-		"味道": {"口味", "滋味", "风味", "口感", "味儿"},
-		"问题": {"疑问", "难题", "困难", "课题", "难点"},
-	}
-
-	sd.mu.Lock()
-	defer sd.mu.Unlock()
-
-	// 将默认同义词添加到词典中
-	for word, synonyms := range defaultSynonyms {
-		if sd.dict[word] == nil {
-			sd.dict[word] = make([]string, 0)
-		}
-		for _, synonym := range synonyms {
-			if !contains(sd.dict[word], synonym) {
-				sd.dict[word] = append(sd.dict[word], synonym)
-			}
-			// 反向添加
-			if sd.dict[synonym] == nil {
-				sd.dict[synonym] = make([]string, 0)
-			}
-			if !contains(sd.dict[synonym], word) {
-				sd.dict[synonym] = append(sd.dict[synonym], word)
-			}
-		}
-	}
-
-	return nil
-}
-
-// GetSynonymsByCiLin 通过哈工大词林获取同义词
-func (sd *SynonymDict) GetSynonymsByCiLin(word string) []string {
+// GetSynonyms 获取同义词
+func (sd *SynonymDict) GetSynonyms(word string) []string {
 	sd.mu.RLock()
 	defer sd.mu.RUnlock()
-
-	// 获取词的编码
-	code, ok := sd.cilinMap[word]
-	if !ok {
-		return nil
-	}
-
-	// 收集所有相同编码的词
-	var synonyms []string
-	for w, c := range sd.cilinMap {
-		if w != word && // 不包含自己
-			c.FirstLevel == code.FirstLevel && // 第一层相同
-			c.SecondLevel == code.SecondLevel && // 第二层相同
-			c.ThirdLevel == code.ThirdLevel { // 第三层相同
-			synonyms = append(synonyms, w)
-		}
-	}
-
-	return synonyms
-}
-
-// GetSynonyms 获取同义词（结合多个来源）
-func (sd *SynonymDict) GetSynonyms(word string) []string {
-	// 首先获取词林中的同义词
-	cilinSynonyms := sd.GetSynonymsByCiLin(word)
-
-	sd.mu.RLock()
-	// 获取基础词典中的同义词
-	basicSynonyms := sd.dict[word]
-	sd.mu.RUnlock()
-
-	// 合并两个来源的同义词
-	result := make([]string, 0)
-	result = append(result, cilinSynonyms...)
-
-	// 添加基础词典中的同义词（去重）
-	for _, syn := range basicSynonyms {
-		if !contains(result, syn) {
-			result = append(result, syn)
-		}
-	}
-
-	return result
-}
-
-// contains 检查切片是否包含某个字符串
-func contains(slice []string, str string) bool {
-	for _, s := range slice {
-		if s == str {
-			return true
-		}
-	}
-	return false
-}
-
-// LoadSynonymDict 加载同义词字典
-func (sd *SynonymDict) LoadSynonymDict(filePath string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		words := strings.Split(line, " ")
-		if len(words) < 2 {
-			continue
-		}
-
-		// 将行内所有词互相设置为同义词
-		for i, word := range words {
-			for j, synonym := range words {
-				if i != j {
-					sd.mu.Lock()
-					if sd.dict[word] == nil {
-						sd.dict[word] = make([]string, 0)
-					}
-					// 检查是否已存在
-					exists := false
-					for _, w := range sd.dict[word] {
-						if w == synonym {
-							exists = true
-							break
-						}
-					}
-					if !exists {
-						sd.dict[word] = append(sd.dict[word], synonym)
-					}
-					sd.mu.Unlock()
+	
+	// 通过词林获取同义词
+	if code, ok := sd.cilinMap[word]; ok {
+		codeStr := fmt.Sprintf("%s%s%s%s%s", 
+			code.FirstLevel, 
+			code.SecondLevel, 
+			code.ThirdLevel, 
+			code.FourthLevel, 
+			code.FifthLevel)
+		if words, exists := sd.codemap[codeStr]; exists {
+			synonyms := make([]string, 0)
+			for _, w := range words {
+				if w != word {
+					synonyms = append(synonyms, w)
 				}
 			}
+			return synonyms
 		}
 	}
-
-	return scanner.Err()
-}
-
-// DownloadSynonymDict 下载同义词典
-func (sd *SynonymDict) DownloadSynonymDict() error {
-	// 可以从多个来源下载
-	sources := []string{
-		"https://raw.githubusercontent.com/fighting41love/funNLP/master/data/同义词库.txt",
-		// 添加其他来源
-	}
-
-	for _, url := range sources {
-		resp, err := http.Get(url)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			continue
-		}
-
-		// 创建临时文件
-		tmpFile, err := os.CreateTemp("", "synonym_dict_*.txt")
-		if err != nil {
-			continue
-		}
-		defer os.Remove(tmpFile.Name())
-
-		if _, err := tmpFile.Write(body); err != nil {
-			continue
-		}
-
-		// 加载下载的词典
-		if err := sd.LoadSynonymDict(tmpFile.Name()); err != nil {
-			continue
-		}
-	}
-
 	return nil
 }
 
-// SaveSynonymDict 保存同义词典到文件
-func (sd *SynonymDict) SaveSynonymDict(filePath string) error {
-	sd.mu.RLock()
-	defer sd.mu.RUnlock()
-
-	// 确保目录存在
-	dir := filepath.Dir(filePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	file, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	return encoder.Encode(sd.dict)
-}
-
-// LoadSynonymDictFromJSON 从JSON文件加载同义词典
-func (sd *SynonymDict) LoadSynonymDictFromJSON(filePath string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	sd.mu.Lock()
-	defer sd.mu.Unlock()
-
-	decoder := json.NewDecoder(file)
-	return decoder.Decode(&sd.dict)
-}
-
-// 初始化同义词典
+// initSynonymDict 初始化同义词典
 func initSynonymDict() error {
-	// 创建数据目录
-	dataDir := "data"
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		return err
+	// 加载哈工大词林
+	err := globalSynonymDict.LoadCiLinDict("data/cilin.txt")
+	if err != nil {
+		return fmt.Errorf("加载词林失败: %v", err)
 	}
-
-	dictPath := filepath.Join(dataDir, "synonym_dict.json")
-
-	// 首先尝试加载本地词典
-	if err := globalSynonymDict.LoadSynonymDictFromJSON(dictPath); err != nil {
-		log.Println("本地词典加载失败，尝试下载...")
-
-		// 下载基础同义词典
-		if err := globalSynonymDict.DownloadSynonymDict(); err != nil {
-			log.Printf("基础同义词典下载失败: %v", err)
-		}
-
-		// 下载哈工大词林
-		if err := globalSynonymDict.DownloadCiLinDict(); err != nil {
-			log.Printf("哈工大词林下载失败: %v", err)
-		}
-
-		// 保存到本地以供将来使用
-		if err := globalSynonymDict.SaveSynonymDict(dictPath); err != nil {
-			log.Printf("保存词典失败: %v", err)
-		}
-	}
-
 	return nil
 }
 
@@ -620,8 +376,9 @@ func main() {
 	// 调整列宽
 	outFile.SetColWidth("Sheet1", "A", "G", 20)
 
-	// 保存为新的Excel文件
-	newFilePath := "output.xlsx"
+	// 生成带时间戳的文件名
+	timestamp := time.Now().Format("2006-01-02_15-04-05")
+	newFilePath := fmt.Sprintf("output_%s.xlsx", timestamp)
 	if err := outFile.SaveAs(newFilePath); err != nil {
 		log.Fatalf("保存结果文件失败：%v", err)
 	}
